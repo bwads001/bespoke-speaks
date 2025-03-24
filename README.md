@@ -1,144 +1,96 @@
-# CSM
+# Bespoke Speaks 🎙️
 
-**2025/03/13** - We are releasing the 1B CSM variant. The checkpoint is [hosted on Hugging Face](https://huggingface.co/sesame/csm_1b).
+A research project exploring natural conversational interactions through a pipeline of Speech-to-Text (STT), Large Language Model (LLM), and Text-to-Speech (TTS) technologies.
 
----
+## Overview
 
-CSM (Conversational Speech Model) is a speech generation model from [Sesame](https://www.sesame.com) that generates RVQ audio codes from text and audio inputs. The model architecture employs a [Llama](https://www.llama.com/) backbone and a smaller audio decoder that produces [Mimi](https://huggingface.co/kyutai/mimi) audio codes.
+Bespoke Speaks is an interactive voice chat application that enables natural conversations with an AI assistant. The system uses a three-stage pipeline:
 
-A fine-tuned variant of CSM powers the [interactive voice demo](https://www.sesame.com/voicedemo) shown in our [blog post](https://www.sesame.com/research/crossing_the_uncanny_valley_of_voice).
+1. **Speech-to-Text**: Converts user speech to text using OpenAI's Whisper model
+2. **Language Model**: Processes the text using Qwen2.5 3B, a powerful open-source language model
+3. **Text-to-Speech**: Generates natural-sounding responses using CSM (Conversational Speech Model)
 
-A hosted [Hugging Face space](https://huggingface.co/spaces/sesame/csm-1b) is also available for testing audio generation.
+## Models Used
 
-## Requirements
+- **Whisper** (OpenAI) - For accurate speech recognition
+  - [Whisper on Hugging Face](https://huggingface.co/openai/whisper-base)
+  - License: MIT
 
-* A CUDA-compatible GPU
-* The code has been tested on CUDA 12.4 and 12.6, but it may also work on other versions
-* Similarly, Python 3.10 is recommended, but newer versions may be fine
-* For some audio operations, `ffmpeg` may be required
-* Access to the following Hugging Face models:
-  * [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
-  * [CSM-1B](https://huggingface.co/sesame/csm-1b)
+- **Qwen2.5 3B** (Alibaba Cloud) - For natural language understanding and response generation
+  - [Qwen2.5 3B on Hugging Face](https://huggingface.co/Qwen/Qwen2.5-3B)
+  - License: Apache 2.0
 
-### Setup
+- **CSM** (Sesame) - For high-quality text-to-speech synthesis
+  - [CSM on Hugging Face](https://huggingface.co/sesame/csm_1b)
+  - License: Apache 2.0
 
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10 or newer
+- CUDA-compatible GPU (recommended)
+- FFmpeg installed on your system
+- Microphone and speakers
+
+### Installation
+
+1. Clone the repository:
 ```bash
-git clone git@github.com:SesameAILabs/csm.git
-cd csm
-python3.10 -m venv .venv
-source .venv/bin/activate
+git clone <your-repo-url>
+cd bespoke-speaks
+```
+
+2. Create and activate a virtual environment:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
 pip install -r requirements.txt
-
-# Disable lazy compilation in Mimi
-export NO_TORCH_COMPILE=1
-
-# You will need access to CSM-1B and Llama-3.2-1B
-huggingface-cli login
 ```
 
-### Windows Setup
+### Running the Application
 
-The `triton` package cannot be installed in Windows. Instead use `pip install triton-windows`.
-
-## Usage
-
-Run the example script:
+1. Start the voice chat:
 ```bash
-python run_csm.py
-```
-You can also create your own script using the example code below.
-
-Generate a sentence
-
-```python
-from generator import load_csm_1b
-import torchaudio
-import torch
-
-if torch.backends.mps.is_available():
-    device = "mps"
-elif torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
-
-generator = load_csm_1b(device=device)
-
-audio = generator.generate(
-    text="Hello from Sesame.",
-    speaker=0,
-    context=[],
-    max_audio_length_ms=10_000,
-)
-
-torchaudio.save("audio.wav", audio.unsqueeze(0).cpu(), generator.sample_rate)
+python llmchat.py
 ```
 
-CSM sounds best when provided with context. You can prompt or provide context to the model using a `Segment` for each speaker's utterance.
+2. Follow the on-screen prompts:
+   - Press Enter to start recording
+   - Speak your message
+   - Wait for the AI's response
+   - Type 'quit' to exit
 
-```python
-from generator import Segment
+## Features
 
-speakers = [0, 1, 0, 0]
-transcripts = [
-    "Hey how are you doing.",
-    "Pretty good, pretty good.",
-    "I'm great.",
-    "So happy to be speaking to you.",
-]
-audio_paths = [
-    "utterance_0.wav",
-    "utterance_1.wav",
-    "utterance_2.wav",
-    "utterance_3.wav",
-]
+- Real-time voice recording with visual feedback
+- High-quality speech recognition
+- Natural language understanding and response generation
+- Natural-sounding voice synthesis
+- Error handling and graceful fallbacks
+- Visual progress indicators during recording
 
-def load_audio(audio_path):
-    audio_tensor, sample_rate = torchaudio.load(audio_path)
-    audio_tensor = torchaudio.functional.resample(
-        audio_tensor.squeeze(0), orig_freq=sample_rate, new_freq=generator.sample_rate
-    )
-    return audio_tensor
+## Technical Notes
 
-segments = [
-    Segment(text=transcript, speaker=speaker, audio=load_audio(audio_path))
-    for transcript, speaker, audio_path in zip(transcripts, speakers, audio_paths)
-]
-audio = generator.generate(
-    text="Me too, this is some cool stuff huh?",
-    speaker=1,
-    context=segments,
-    max_audio_length_ms=10_000,
-)
+- The application uses Triton for optimization, but compilation is disabled by default for better compatibility
+- Audio is recorded at 16kHz sample rate for optimal Whisper performance
+- The application automatically uses CUDA if available, falling back to CPU if not
 
-torchaudio.save("audio.wav", audio.unsqueeze(0).cpu(), generator.sample_rate)
-```
+## Contributing
 
-## FAQ
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-**Does this model come with any voices?**
+## License
 
-The model open-sourced here is a base generation model. It is capable of producing a variety of voices, but it has not been fine-tuned on any specific voice.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-**Can I converse with the model?**
+## Acknowledgments
 
-CSM is trained to be an audio generation model and not a general-purpose multimodal LLM. It cannot generate text. We suggest using a separate LLM for text generation.
-
-**Does it support other languages?**
-
-The model has some capacity for non-English languages due to data contamination in the training data, but it likely won't do well.
-
-## Misuse and abuse ⚠️
-
-This project provides a high-quality speech generation model for research and educational purposes. While we encourage responsible and ethical use, we **explicitly prohibit** the following:
-
-- **Impersonation or Fraud**: Do not use this model to generate speech that mimics real individuals without their explicit consent.
-- **Misinformation or Deception**: Do not use this model to create deceptive or misleading content, such as fake news or fraudulent calls.
-- **Illegal or Harmful Activities**: Do not use this model for any illegal, harmful, or malicious purposes.
-
-By using this model, you agree to comply with all applicable laws and ethical guidelines. We are **not responsible** for any misuse, and we strongly condemn unethical applications of this technology.
-
----
-
-## Authors
-Johan Schalkwyk, Ankit Kumar, Dan Lyth, Sefik Emre Eskimez, Zack Hodari, Cinjon Resnick, Ramon Sanabria, Raven Jiang, and the Sesame team.
+- OpenAI for the Whisper model
+- Alibaba Cloud for the Qwen2.5 model
+- Sesame for the CSM model
+- All contributors and maintainers of the open-source libraries used in this project
