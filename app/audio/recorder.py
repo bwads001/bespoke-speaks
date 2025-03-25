@@ -16,7 +16,7 @@ class VoiceActivityDetector:
     """
     
     def __init__(self, 
-                 energy_threshold: float = 0.05,
+                 energy_threshold: float = 0.005,  # Reduced from 0.05 to match actual audio levels
                  silence_duration: float = 0.7,   # Increased from 0.3 to 0.7 seconds
                  sample_rate: int = 16000):
         """
@@ -39,7 +39,7 @@ class VoiceActivityDetector:
         
         # Keep track of noise floor for adaptive thresholding
         self._noise_levels = []
-        self._noise_floor = 0.002  # Initial noise floor estimate
+        self._noise_floor = 0.0005  # Reduced initial noise floor estimate
         self._adaptive_threshold = energy_threshold  # Start with the provided threshold
         self._noise_calibration_frames = 0  # Counter for noise calibration
         
@@ -75,105 +75,76 @@ class VoiceActivityDetector:
             self._noise_levels.append(rms_energy)
             self._noise_calibration_frames += 1
             
-            if len(self._noise_levels) >= 20:  # Wait until we have enough samples
-                # Calculate noise floor as the 10th percentile of observed energy levels
+            if len(self._noise_levels) >= 20:
                 self._noise_floor = np.percentile(self._noise_levels, 10)
-                # Set adaptive threshold higher than the noise floor
-                self._adaptive_threshold = max(self._energy_threshold, self._noise_floor * 4)
+                self._adaptive_threshold = max(self._energy_threshold, self._noise_floor * 8)
         
         # Determine if energy is above threshold with hysteresis
         if self._is_speaking:
             # When already speaking, use a lower threshold to continue detection
-            is_above_threshold = rms_energy > (self._adaptive_threshold * 0.7)
+            is_above_threshold = rms_energy > (self._adaptive_threshold * 0.5)
         else:
             # When not speaking, require a higher threshold to start
             is_above_threshold = rms_energy > self._adaptive_threshold
         
-        # Print debug information periodically
+        # Print level meter (only if changed to avoid flickering)
         self._debug_counter += 1
-        if self._debug_counter % 5 == 0:  # Update more frequently
-            self._logger.debug(f"RMS: {rms_energy:.6f}, Peak: {peak_amplitude:.6f}, Threshold: {self._adaptive_threshold:.6f}")
+        if self._debug_counter % 5 == 0:
+            # Scale using expected microphone levels (0.3 = 100%)
+            scaled_value = min(1.0, peak_amplitude / 0.3)
+            percentage = int(scaled_value * 100)
             
-            # Create visual audio level meter
-            # Check for true silence
-            if peak_amplitude < 0.001:  # Lowered true silence threshold
-                # Show silent state with full width padding and debug info
-                status = "SILENT"
-                if self._is_speaking:
-                    status += " [SPEAKING]"
-                print(f"\r🎤 Level: ▁ ░░░░░░░░░░░░░░░░░░░░   0% | RMS:{rms_energy:.4f} Peak:{peak_amplitude:.4f} TH:{self._adaptive_threshold:.4f} | {status}", end="", flush=True)
-                self._last_printed_level = 0
-            else:
-                # Scale using expected microphone levels
-                # Cap at 100% (20 bars) when reaching 0.3
-                scaled_value = min(1.0, peak_amplitude / 0.3)  # Cap at 0.3 for 100%
-                percentage = int(scaled_value * 100)
+            # Only update if value changed significantly or status changed
+            if (abs(percentage - self._last_printed_level) >= 2 or 
+                bool(is_above_threshold) != bool(self._is_speaking)):
                 
-                # For threshold, use the adaptive threshold relative to max amplitude scale
-                threshold_position = int((self._adaptive_threshold / 0.3) * 20)
-                threshold_position = min(19, max(0, threshold_position))
-                
-                # Create visual bar
+                # Create visual bar with threshold marker
                 bars = int(scaled_value * 20)
                 bar = "█" * bars + "░" * (20 - bars)
+                threshold_position = min(19, max(0, int((self._adaptive_threshold / 0.3) * 20)))
+                bar_list = list(bar)
+                bar_list[threshold_position] = "▐"
+                bar = "".join(bar_list)
                 
-                # Add threshold marker
-                if threshold_position < 20:
-                    bar_list = list(bar)
-                    bar_list[threshold_position] = "▐"  # Threshold marker
-                    bar = "".join(bar_list)
-                
-                # Unicode bar height based on RMS energy
+                # Unicode bar height based on RMS
                 rms_scaled = min(1.0, rms_energy / 0.3)
                 meter = "▁▂▃▄▅▆▇█"[min(7, int(rms_scaled * 8))]
                 
-                # Add speech state indicator
-                status = "ACTIVE" if self._is_speaking else "QUIET"
-                if self._consecutive_silence_frames > 0:
-                    status += f" [silence:{self._consecutive_silence_frames}/{self._min_silence_frames}]"
-                elif self._consecutive_speech_frames > 0:
-                    status += f" [speech:{self._consecutive_speech_frames}/{self._min_speech_frames}]"
+                # Simplified status display
+                if self._is_speaking:
+                    status = "SPEAKING"
+                else:
+                    status = "LISTENING"
                 
-                # Print the audio meter with debug info (only if changed to avoid flickering)
-                if percentage != self._last_printed_level:
-                    # Clear the entire line before printing new content
-                    print(f"\r\033[K🎤 Level: {meter} {bar} {percentage:3d}% | RMS:{rms_energy:.4f} Peak:{peak_amplitude:.4f} TH:{self._adaptive_threshold:.4f} | {status}", end="", flush=True)
-                    self._last_printed_level = percentage
+                # Clear line and print updated meter
+                print(f"\r\033[K🎤 {meter} {bar} {percentage:3d}% | {status}", end="", flush=True)
+                self._last_printed_level = percentage
         
-        # Implement conservative speech detection with hysteresis
+        # Track speech and silence frames
         if is_above_threshold:
             self._consecutive_speech_frames += 1
             self._consecutive_silence_frames = 0
+            if self._is_speaking:
+                self._last_speech_time = time.time()
         else:
             self._consecutive_speech_frames = 0
             self._consecutive_silence_frames += 1
         
-        # Require multiple consecutive frames above threshold to consider it speech
-        if self._consecutive_speech_frames >= self._min_speech_frames and not self._is_speaking:
-            # Additional check: ensure RMS energy is also high enough
+        # Start speaking when we have enough consecutive speech frames
+        if not self._is_speaking and self._consecutive_speech_frames >= self._min_speech_frames:
             if rms_energy > self._energy_threshold:
                 self._is_speaking = True
                 self._last_speech_time = time.time()
-                self._logger.info(f"Speech started (RMS: {rms_energy:.6f}, Peak: {peak_amplitude:.4f}, Threshold: {self._adaptive_threshold:.6f})")
-                print(f"\n🎙️ Speech detected! [RMS:{rms_energy:.4f} > threshold {self._adaptive_threshold:.4f}]")
-                print("🎙️ Speaking...", flush=True)
-            else:
-                # Reset if RMS too low despite energy threshold
-                self._consecutive_speech_frames = 0
+                print("\n\r\033[K🎙️ Listening to your message...", flush=True)
         
-        # Require consecutive frames below threshold to end speech (hysteresis)
-        elif self._is_speaking and self._consecutive_silence_frames >= self._min_silence_frames:
-            silence_duration = time.time() - self._last_speech_time
-            if silence_duration > self._silence_duration:
-                self._is_speaking = False
-                self._logger.info(f"Speech ended (silence duration: {silence_duration:.2f}s, RMS: {rms_energy:.6f}, Threshold: {self._adaptive_threshold:.6f})")
-                print(f"\n🔍 Speech ended after {silence_duration:.2f}s of silence")
-                print("🔍 Processing speech...", flush=True)
-                return False  # This will trigger the speech->silence transition
-        
-        # Update last speech time if we're speaking and energy is above threshold
-        if self._is_speaking and is_above_threshold:
-            self._last_speech_time = time.time()
+        # End speaking when we have enough silence frames AND enough time has passed
+        elif self._is_speaking:
+            if self._consecutive_silence_frames >= self._min_silence_frames:
+                time_since_speech = time.time() - self._last_speech_time
+                if time_since_speech >= self._silence_duration:
+                    self._is_speaking = False
+                    print("\n\r\033[K🔍 Processing your message...", flush=True)
+                    return False
         
         return self._is_speaking
     
