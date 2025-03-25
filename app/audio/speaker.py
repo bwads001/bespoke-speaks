@@ -9,8 +9,8 @@ import torchaudio
 from huggingface_hub import hf_hub_download
 
 from app.utils.event_bus import EventBus
-from generator import Segment
-from app.audio.csm_service import initialize, generate_speech, cleanup
+from app.utils.model_loader import ModelLoader
+from app.models.generator import get_or_create_generator, prepare_prompt_segment, Segment
 
 class Speaker:
     """
@@ -38,7 +38,6 @@ class Speaker:
         self._is_speaking = False
         self._playback_thread: Optional[threading.Thread] = None
         self._should_stop_playback = False
-        self._loading_complete = True  # Used for loading indicator
         
         # Register for interruption events
         self.event_bus.subscribe("user_interruption", self._handle_interruption)
@@ -54,71 +53,47 @@ class Speaker:
             bool: True if model loaded successfully, False otherwise
         """
         self._logger.info(f"Loading CSM model on {self.device}...")
-        print(f"\n🔊 Loading CSM text-to-speech model...")
-        
-        # Show loading progress indicator
-        loading_thread = threading.Thread(target=self._show_loading_progress)
-        loading_thread.daemon = True
-        loading_thread.start()
-        
-        # Flag to track loading status
-        self._loading_complete = False
         
         try:
-            # Initialize CSM service
-            success = initialize(self.device)
-            
-            # Signal that loading is complete to stop the progress indicator
-            self._loading_complete = True
-            if loading_thread.is_alive():
-                loading_thread.join(timeout=1.0)
-            
-            if not success:
-                self._loading_complete = True
-                if loading_thread.is_alive():
-                    loading_thread.join(timeout=1.0)
+            # Use the model loader utility with a custom load function
+            def load_csm_components():
+                # Get the generator and prompt segment
+                generator = get_or_create_generator(self.device)
+                prompt_segment = prepare_prompt_segment(self.device)
                 
-                print(f"❌ Failed to load CSM model - speech generation is a critical feature")
+                return {
+                    "generator": generator,
+                    "prompt_segment": prompt_segment
+                }
+            
+            # Use the unified model loader
+            result = ModelLoader.load_model(
+                load_function=load_csm_components,
+                model_name="CSM 1B",
+                device=self.device,
+                model_type="speech",
+                event_bus=self.event_bus
+            )
+            
+            if not result:
                 self._logger.error("Failed to load CSM model - speech generation is a critical feature")
                 self.event_bus.publish("critical_error", "Text-to-speech system failed. Application cannot function properly without speech capability.")
                 return False
-                
+            
+            # Store references to the loaded components
+            self.csm_generator = result["generator"]
+            self.prompt_segment = result["prompt_segment"]
+            
             self._logger.info("CSM model loaded successfully")
-            print(f"✅ CSM model loaded successfully")
             return True
             
         except Exception as e:
-            # Signal that loading is complete/failed to stop the progress indicator
-            self._loading_complete = True
-            if loading_thread.is_alive():
-                loading_thread.join(timeout=1.0)
-                
             # Print detailed error information
             self._logger.error(f"Error loading CSM model: {e}", exc_info=True)
-            print(f"\n❌ Failed to load CSM model: {str(e)}")
-            
-            # Provide additional troubleshooting information
-            if "CUDA out of memory" in str(e):
-                print("   Memory error detected. Try closing other applications to free GPU memory.")
-            elif "module 'torch' has no attribute 'bfloat16'" in str(e):
-                print("   Your PyTorch version might not support bfloat16. Try upgrading PyTorch.")
-            elif "ModuleNotFoundError" in str(e):
-                print("   Missing module. Ensure you've installed all requirements.")
             
             # This is a critical failure
             self.event_bus.publish("critical_error", "Text-to-speech system failed. Application cannot function properly without speech capability.")
             return False
-    
-    def _show_loading_progress(self):
-        """Show a loading progress indicator while the model is loading."""
-        self._loading_complete = False
-        indicators = "|/-\\"
-        i = 0
-        
-        while not self._loading_complete:
-            print(f"\r📂 Loading CSM model... {indicators[i % len(indicators)]}", end="", flush=True)
-            i += 1
-            time.sleep(0.2)
     
     def _handle_interruption(self, _: Optional[dict] = None) -> None:
         """Handle user interruption event."""
@@ -178,17 +153,25 @@ class Speaker:
         self.event_bus.publish("tts_started", {"text": text})
         
         try:
-            # Generate speech using simplified approach
+            # Generate speech using direct approach with our generator
             self._logger.info(f"Generating speech for: {text}...")
-            # Use logger instead of print to avoid duplicate console messages
-            self._logger.info("Generating speech...")
             print(f"🔊 Generating speech... [ID: speech-gen-{id(text)}]")
             
-            # Generate audio
+            # Generate audio using direct model access - no wrapper service call
             generation_start = time.time()
             
-            # No fallback or retry - just generate or fail
-            audio_np, sample_rate = generate_speech(text, speaker_id=1)
+            # Generate with direct model access
+            audio_tensor = self.csm_generator.generate(
+                text=text,
+                speaker=1,
+                context=[self.prompt_segment],
+                max_audio_length_ms=10_000,
+                temperature=0.7,
+                topk=50,
+            )
+            
+            # Convert to numpy for playback
+            audio_np = audio_tensor.cpu().numpy()
             
             generation_time = time.time() - generation_start
             self._logger.info(f"Speech generation took {generation_time:.2f} seconds")
@@ -199,6 +182,7 @@ class Speaker:
                 return
                 
             # Calculate audio duration
+            sample_rate = self.csm_generator.sample_rate
             audio_duration = len(audio_np) / sample_rate
             self._logger.info(f"Audio duration: {audio_duration:.2f} seconds")
             
@@ -240,41 +224,24 @@ class Speaker:
         except Exception as e:
             error_msg = str(e)
             
-            # Simple error reporting with no fallback
-            if "cache_pos" in error_msg or "AssertionError" in error_msg:
-                print("\n❌ Speech generation failed due to CSM KV cache error")
-            else:
-                print(f"\n❌ Speech generation error: {error_msg}")
-            
+            # Error reporting without fallback
             self._logger.error(f"Speech generation error: {e}", exc_info=True)
+            print(f"\n❌ Speech generation error: {error_msg}")
             self.event_bus.publish("speak_error", error_msg)
             
-            # Signal critical error - application should exit
-            self.event_bus.publish("critical_error", "Text-to-speech system failed. Application cannot function properly without speech capability.")
-            
         finally:
-            # Always notify that TTS has finished, even if it failed
-            self.event_bus.publish("tts_finished", {"text": text})
-            
-            # Update state
             self._is_speaking = False
-            self._should_stop_playback = False
-            
-            # We don't clean up CSM resources here anymore to preserve the model between calls
-            # Only clean up in extreme cases where we need to reset
+            # Notify that TTS has finished, regardless of success or failure
+            self.event_bus.publish("tts_finished", None)
     
     def stop_playback(self) -> None:
-        """Stop audio playback immediately."""
-        if self._is_speaking:
-            self._should_stop_playback = True
-            sd.stop()
-            
-            # Wait for playback thread to complete
-            if self._playback_thread and self._playback_thread.is_alive():
-                self._playback_thread.join(timeout=1.0)
-                
-            self._is_speaking = False
-            self._logger.debug("Playback stopped")
+        """Stop any ongoing speech playback."""
+        self._should_stop_playback = True
+        
+        # Stop audio playback
+        sd.stop()
+        
+        self._logger.info("Playback stopped")
     
     def is_speaking(self) -> bool:
         """
@@ -283,51 +250,31 @@ class Speaker:
         Returns:
             True if currently speaking, False otherwise
         """
-        return self._is_speaking 
-        
+        return self._is_speaking
+
     def wait_for_playback_complete(self, timeout: float = 30.0) -> None:
         """
-        Wait until speech playback is complete.
-        
-        This method blocks until any ongoing speech playback is complete
-        or until the timeout is reached.
+        Wait for current playback to complete.
         
         Args:
-            timeout: Maximum time to wait in seconds
+            timeout: Maximum seconds to wait
         """
-        start_time = time.time()
-        
-        # If we're not speaking, return immediately
-        if not self._is_speaking and not self._playback_thread:
+        if not self._is_speaking:
             return
             
-        # Wait for playback thread to complete
-        while (self._is_speaking or 
-              (self._playback_thread and self._playback_thread.is_alive())):
-            
-            # Check if we've exceeded the timeout
-            if time.time() - start_time > timeout:
-                self._logger.warning(f"Timeout waiting for playback to complete after {timeout}s")
-                break
-                
-            # Short sleep to avoid busy waiting
+        start_time = time.time()
+        
+        while self._is_speaking and time.time() - start_time < timeout:
             time.sleep(0.1)
-            
-        self._logger.debug("Finished waiting for playback")
 
     def cleanup(self) -> None:
-        """Clean up resources used by the Speaker."""
-        try:
-            # Stop any ongoing playback
-            self.stop_playback()
-                
-            # Free any CUDA memory used by models
-            try:
-                cleanup()
-            except Exception as e:
-                self._logger.error(f"Error during CSM cleanup: {e}")
-                
-            self._logger.info("Speaker resources cleaned up")
-        except Exception as e:
-            self._logger.error(f"Error cleaning up Speaker resources: {e}")
-            print(f"⚠️ Error cleaning up speaker: {e}") 
+        """Clean up resources used by the speaker."""
+        # Stop any ongoing playback
+        self.stop_playback()
+        
+        # Wait for any ongoing speech to complete
+        self.wait_for_playback_complete(timeout=2.0)
+        
+        # No explicit resource cleanup needed for CSM model
+        # It will be garbage collected when the app exits
+        self._logger.info("Speaker resources cleaned up") 

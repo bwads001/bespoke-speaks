@@ -9,7 +9,7 @@ import importlib.util
 from huggingface_hub import hf_hub_download
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from generator import load_csm_1b, Segment
+from demo.generator import load_csm_1b, Segment
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 

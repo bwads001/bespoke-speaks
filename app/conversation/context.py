@@ -2,7 +2,7 @@ import logging
 from typing import List, Optional
 import torch
 
-from generator import Segment
+from app.models.generator import Segment
 from app.utils.event_bus import EventBus
 
 class ConversationContext:

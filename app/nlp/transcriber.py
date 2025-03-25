@@ -7,6 +7,7 @@ import time
 
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from app.utils.event_bus import EventBus
+from app.utils.model_loader import ModelLoader
 
 class StreamingTranscriber:
     """
@@ -47,19 +48,35 @@ class StreamingTranscriber:
     
     def _load_models(self) -> bool:
         """Lazy-load the Whisper model if not already loaded."""
-        if self._model is None or self._processor is None:
-            self._logger.info(f"Loading Whisper model {self.model_name} on {self.device}...")
-            print(f"\n🔄 Loading Whisper model {self.model_name}...")
-            try:
-                self._processor = WhisperProcessor.from_pretrained(self.model_name)
-                self._model = WhisperForConditionalGeneration.from_pretrained(self.model_name).to(self.device)
-                self._logger.info("Whisper model loaded successfully")
-                print(f"✅ Whisper model loaded successfully!")
-                return True
-            except Exception as e:
-                self._logger.error(f"Error loading Whisper model: {e}")
-                print(f"❌ Failed to load Whisper model: {e}")
-                return False
+        if self._model is not None and self._processor is not None:
+            return True
+            
+        self._logger.info(f"Loading Whisper model {self.model_name} on {self.device}...")
+        
+        # Define the loading function
+        def load_whisper_models():
+            processor = WhisperProcessor.from_pretrained(self.model_name)
+            model = WhisperForConditionalGeneration.from_pretrained(self.model_name).to(self.device)
+            
+            return {
+                "model": model,
+                "processor": processor
+            }
+        
+        # Use the common model loader utility
+        result = ModelLoader.load_model(
+            load_function=load_whisper_models,
+            model_name=self.model_name.split('/')[-1],
+            device=self.device,
+            model_type="whisper",
+            event_bus=self.event_bus
+        )
+        
+        if not result:
+            return False
+            
+        self._model = result["model"]
+        self._processor = result["processor"]
         return True
     
     def subscribe_to_audio_events(self) -> None:

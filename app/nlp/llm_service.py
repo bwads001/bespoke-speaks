@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional, Callable
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from app.utils.event_bus import EventBus
+from app.utils.model_loader import ModelLoader
 
 # Check if accelerate is available
 has_accelerate = importlib.util.find_spec("accelerate") is not None
@@ -67,56 +68,51 @@ class LLMService:
         Returns:
             True if models were loaded successfully, False otherwise
         """
-        if self._model is None or self._tokenizer is None:
-            self._logger.info(f"Loading LLM model {self.model_name}...")
-            print(f"\n🧠 Loading language model {self.model_name.split('/')[-1]}...")
+        if self._model is not None and self._tokenizer is not None:
+            return True
             
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._logger.info(f"Loading LLM model {self.model_name}...")
+        
+        # Define model loading function
+        def load_llm_models():
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            
+            # Different loading approaches depending on accelerate availability
+            model_kwargs = {
+                "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
+            }
+            
+            if has_accelerate:
+                model_kwargs["device_map"] = "auto"
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                **model_kwargs
+            )
+            
+            # If accelerate is not available, move model to device manually
+            if not has_accelerate:
+                model = model.to(self.device)
                 
-                # Different loading approaches depending on accelerate availability
-                model_kwargs = {
-                    "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
-                }
-                
-                if has_accelerate:
-                    self._logger.info("Using accelerate for efficient model loading")
-                    print(f"  • Using accelerate for efficient model loading")
-                    model_kwargs["device_map"] = "auto"
-                else:
-                    self._logger.info("Accelerate not found, loading model directly to device")
-                    print(f"  • Loading model directly to device (no accelerate)")
-                    # Without accelerate, we don't use device_map
-                
-                try:
-                    self._model = AutoModelForCausalLM.from_pretrained(
-                        self.model_name,
-                        **model_kwargs
-                    )
-                    
-                    # If accelerate is not available, move model to device manually
-                    if not has_accelerate:
-                        self._model = self._model.to(self.device)
-                        
-                except ImportError as e:
-                    if "requires Accelerate" in str(e):
-                        self._logger.error("Error: accelerate package is required.")
-                        self._logger.error("Please install with: pip install 'accelerate>=0.26.0'")
-                        print(f"\n❌ Error: accelerate package is required.")
-                        print(f"   Please install with: pip install 'accelerate>=0.26.0'")
-                        return False
-                    else:
-                        raise
-                        
-                self._logger.info("LLM model loaded successfully")
-                print(f"✅ Language model loaded successfully")
-                return True
-                
-            except Exception as e:
-                self._logger.error(f"Error loading LLM model: {e}")
-                print(f"❌ Failed to load language model: {e}")
-                return False
-                
+            return {
+                "model": model,
+                "tokenizer": tokenizer
+            }
+        
+        # Use the common model loader utility
+        result = ModelLoader.load_model(
+            load_function=load_llm_models,
+            model_name=self.model_name.split('/')[-1],
+            device=self.device,
+            model_type="llm",
+            event_bus=self.event_bus
+        )
+        
+        if not result:
+            return False
+            
+        self._model = result["model"]
+        self._tokenizer = result["tokenizer"]
         return True
     
     def handle_generate_response(self, conversation_history: List[Dict[str, str]]) -> None:

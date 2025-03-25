@@ -26,8 +26,6 @@ from app.conversation.manager import ConversationManager
 from app.conversation.context import ConversationContext
 from app.conversation.interruption import InterruptionHandler
 from app.utils.conversation_saver import ConversationSaver
-# Import csm cleanup directly from service
-from app.audio.csm_service import cleanup
 
 class BespokeApp:
     """

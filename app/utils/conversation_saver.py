@@ -7,7 +7,7 @@ import logging
 from typing import List, Dict, Any, Optional
 import numpy as np
 
-from generator import Segment
+from app.models.generator import Segment
 from app.utils.event_bus import EventBus
 
 class ConversationSaver:

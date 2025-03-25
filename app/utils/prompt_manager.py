@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional, Callable
 import os
 
 from huggingface_hub import hf_hub_download
-from generator import Segment
+from app.models.generator import Segment
 
 class PromptManager:
     """
