@@ -1,96 +1,96 @@
-# Bespoke Speaks 🎙️
+# Bespoke Speaks
 
-A research project exploring natural conversational interactions through a pipeline of Speech-to-Text (STT), Large Language Model (LLM), and Text-to-Speech (TTS) technologies.
+Bespoke Speaks is a natural voice conversation system that combines speech-to-text, large language models, and advanced text-to-speech capabilities to create a seamless conversational AI experience.
 
-## Overview
+## Features
 
-Bespoke Speaks is an interactive voice chat application that enables natural conversations with an AI assistant. The system uses a three-stage pipeline:
+- **Natural Conversation Flow**: Streaming audio processing with support for user interruptions
+- **High-Quality Text-to-Speech**: Using the CSM (Composition of Semantic Modules) model for lifelike speech generation
+- **Advanced Language Understanding**: Integration with state-of-the-art LLMs (Default: Qwen 2.5-3B)
+- **Modular Architecture**: Event-driven design for easy extensibility
+- **Voice Context Preservation**: Maintains consistent voice characteristics throughout the conversation
+- **Conversation Saving**: Save conversations as audio files with metadata
 
-1. **Speech-to-Text**: Converts user speech to text using OpenAI's Whisper model
-2. **Language Model**: Processes the text using Qwen2.5 3B, a powerful open-source language model
-3. **Text-to-Speech**: Generates natural-sounding responses using CSM (Conversational Speech Model)
+## Architecture
 
-## Models Used
+Bespoke Speaks follows a modular, event-driven architecture:
 
-- **Whisper** (OpenAI) - For accurate speech recognition
-  - [Whisper on Hugging Face](https://huggingface.co/openai/whisper-base)
-  - License: MIT
+- **Audio Module**: Handles recording and playback
+- **NLP Module**: Manages transcription and language model interactions
+- **Conversation Module**: Maintains conversation state and handles interruptions
+- **Utils Module**: Provides common utilities like event bus and prompt management
 
-- **Qwen2.5 3B** (Alibaba Cloud) - For natural language understanding and response generation
-  - [Qwen2.5 3B on Hugging Face](https://huggingface.co/Qwen/Qwen2.5-3B)
-  - License: Apache 2.0
-
-- **CSM** (Sesame) - For high-quality text-to-speech synthesis
-  - [CSM on Hugging Face](https://huggingface.co/sesame/csm_1b)
-  - License: Apache 2.0
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.10 or newer
-- CUDA-compatible GPU (recommended)
-- FFmpeg installed on your system
-- Microphone and speakers
-
-### Installation
+## Installation
 
 1. Clone the repository:
 ```bash
-git clone <your-repo-url>
+git clone <repository-url>
 cd bespoke-speaks
 ```
 
-2. Create and activate a virtual environment:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
-
-3. Install dependencies:
+2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-### Running the Application
-
-1. Start the voice chat:
+3. Make sure you have ffmpeg installed:
 ```bash
-python llmchat.py
+# Ubuntu/Debian
+sudo apt-get install ffmpeg
+
+# macOS (using Homebrew)
+brew install ffmpeg
+
+# Windows (using Chocolatey)
+choco install ffmpeg
 ```
 
-2. Follow the on-screen prompts:
-   - Press Enter to start recording
-   - Speak your message
-   - Wait for the AI's response
-   - Type 'quit' to exit
+## Usage
 
-## Features
+Run the application with default settings:
 
-- Real-time voice recording with visual feedback
-- High-quality speech recognition
-- Natural language understanding and response generation
-- Natural-sounding voice synthesis
-- Error handling and graceful fallbacks
-- Visual progress indicators during recording
+```bash
+python -m app.main
+```
 
-## Technical Notes
+### Command Line Arguments
 
-- The application uses Triton for optimization, but compilation is disabled by default for better compatibility
-- Audio is recorded at 16kHz sample rate for optimal Whisper performance
-- The application automatically uses CUDA if available, falling back to CPU if not
+The following command-line arguments are available:
 
-## Contributing
+- `--log-level`: Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `--log-file`: Specify the log file path
+- `--model`: Choose the LLM model to use
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Example with custom settings:
+
+```bash
+python -m app.main --log-level DEBUG --model Qwen/Qwen2.5-7B-Instruct
+```
+
+## Development
+
+The system is designed for modularity and extensibility:
+
+1. **Event System**: Components communicate via the event bus system in `app/utils/event_bus.py`
+2. **Adding New Components**: Create new modules in the appropriate directory and integrate them through the event system
+3. **Custom Voice Prompts**: Add new voice prompts in the `app/utils/prompt_manager.py` file
+
+## Hardware Requirements
+
+- **Minimum**: 16GB RAM, 4-core CPU
+- **Recommended**: CUDA-capable GPU with 8GB+ VRAM, 32GB RAM
+- **Audio**: Microphone and speakers/headphones
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project uses models with various licenses:
+
+- CSM 1B: [Apache 2.0 License](https://github.com/SesameAILabs/csm)
+- Whisper: [MIT License](https://github.com/openai/whisper)
+- Qwen 2.5: [Qwen License](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
 
 ## Acknowledgments
 
-- OpenAI for the Whisper model
-- Alibaba Cloud for the Qwen2.5 model
-- Sesame for the CSM model
-- All contributors and maintainers of the open-source libraries used in this project
+- CSM model from Sesame AI Labs
+- Whisper model from OpenAI
+- Qwen 2.5 model from Alibaba Cloud
