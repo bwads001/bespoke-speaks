@@ -228,11 +228,8 @@ class BespokeApp:
             # Prepare the greeting
             initial_greeting = "Hello! I'm your voice assistant. How can I help you today?"
             
-            # Let's ensure our models are ready (they should already be initialized)
+            # Ensure our models are ready (they should already be initialized)
             print("\n📢 Verifying speech capability...")
-            
-            # Remove explicit reload of models - they are already loaded during component initialization
-            # in the Speaker's __init__ method
             
             print("\n🔄 Preparing speech recognition...")
             self.transcriber._load_models()
@@ -242,21 +239,24 @@ class BespokeApp:
             
             # Initial greeting - first speak, then start listening
             print("\n🗣️  Initial greeting...")
-            # Print greeting only ONCE here
             print(f"💬 AI: \"{initial_greeting}\"")
             
-            # Publish AI message for other components
-            # This will trigger the ConversationManager to handle it and publish a speak_response event
+            # Directly call speak method for the initial greeting - this ensures it's actually spoken
+            success = self.speaker.speak(initial_greeting)
+            if not success:
+                self.logger.warning("Failed to generate speech for initial greeting")
+                print("⚠️ Warning: Could not generate speech for greeting")
+            
+            # Add initial greeting to conversation history for context
             self.event_bus.publish("ai_message", initial_greeting)
             
             # Wait for speech to complete before continuing
-            # This blocks until speech generation and playback is done
-            self.speaker.wait_for_playback_complete()
+            if not self.speaker.wait_for_playback_complete(timeout=60.0):
+                print("⚠️ Continuing anyway after timeout")
             
             # NOW start the recorder after the greeting is completed
+            print("\n👂 Starting audio capture...")
             self.recorder.start_streaming()
-            
-            # No need to print additional UI messages, they're now in the recorder
             
             # Main application loop
             self._main_loop()

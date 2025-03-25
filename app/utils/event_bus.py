@@ -1,5 +1,7 @@
-from typing import Callable, Dict, List, Any
+from typing import Callable, Dict, List, Any, TypeVar, Optional
 import logging
+
+T = TypeVar('T')
 
 class EventBus:
     """
@@ -57,6 +59,34 @@ class EventBus:
                 callback(data)
             except Exception as e:
                 self._logger.error(f"Error in event handler for {event_type}: {e}")
+    
+    def publish_and_get_result(self, event_type: str, data: Any = None, default_result: Optional[T] = None) -> T:
+        """
+        Publish an event and get a result from the first subscriber.
+        
+        This is useful for requesting data from components.
+        
+        Args:
+            event_type: The type of event to publish
+            data: The data to pass to subscribers
+            default_result: Default value to return if no subscribers or if they return None
+            
+        Returns:
+            The result from the first subscriber that returns a non-None value,
+            or default_result if no valid results
+        """
+        if event_type not in self._subscribers:
+            return default_result
+        
+        for callback in self._subscribers[event_type]:
+            try:
+                result = callback(data)
+                if result is not None:
+                    return result
+            except Exception as e:
+                self._logger.error(f"Error in event handler for {event_type}: {e}")
+        
+        return default_result
     
     def clear_all_subscribers(self) -> None:
         """Remove all subscribers from the event bus."""

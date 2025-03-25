@@ -92,48 +92,93 @@ class StreamingTranscriber:
         # Preload the model to avoid delay on first transcription
         self._load_models()
     
-    def process_utterance(self, audio_data: np.ndarray) -> None:
+    def process_utterance(self, audio_data, force_transcribe=False):
         """
-        Process a complete utterance asynchronously.
+        Process a complete utterance and emit transcription event.
         
         Args:
-            audio_data: Audio data as numpy array
+            audio_data: Audio array from recorder
+            force_transcribe: Whether to force transcription even during speech generation
         """
-        # Print information about the audio data received
-        if audio_data is None:
-            self._logger.error("Received None audio data in process_utterance")
-            print("\n❌ Error: Received empty audio data")
-            return
-            
-        # More detailed logging and clear visual indication
-        print("\n" + "+" * 50)
-        print("📣 TRANSCRIPTION REQUEST RECEIVED")
-        print("+" * 50)
+        # Skip transcription if system is generating speech, unless forced
+        if not force_transcribe and self.event_bus.publish_and_get_result("is_speech_generating", None, default_result=False):
+            self._logger.warning("Speech generation in progress, skipping transcription")
+            return None
         
-        self._logger.info(f"process_utterance called with {len(audio_data)} samples, max amplitude: {np.abs(audio_data).max():.4f}")
-        print(f"🔍 Processing audio: {len(audio_data)} samples, duration: {len(audio_data)/self.sample_rate:.2f}s")
+        # Track the utterance ID to prevent duplicate processing
+        utterance_id = id(audio_data)
+        if hasattr(self, '_last_processed_utterance_id') and self._last_processed_utterance_id == utterance_id:
+            self._logger.warning(f"Duplicate utterance detected (ID: {utterance_id}), skipping")
+            return None
         
-        # Skip processing if the audio is too short (likely noise)
-        if len(audio_data) < 0.2 * self.sample_rate:  # Less than 0.2 seconds (reduced from 0.5)
-            self._logger.warning(f"Audio too short ({len(audio_data)/self.sample_rate:.2f}s), skipping transcription")
-            print(f"\n⚠️ Audio too short ({len(audio_data)/self.sample_rate:.2f}s), skipping transcription")
-            return
-            
-        # Print the length of the audio data in seconds
-        audio_duration = len(audio_data) / self.sample_rate
-        self._logger.info(f"Processing utterance of {audio_duration:.2f} seconds")
-        print(f"\n🔄 Transcribing audio ({audio_duration:.2f}s)...")
-            
-        # Start transcription in a separate thread to avoid blocking
-        self._transcription_thread = threading.Thread(
-            target=self._transcribe_audio,
-            args=(audio_data,)
-        )
-        self._transcription_thread.daemon = True
-        self._transcription_thread.start()
+        self._last_processed_utterance_id = utterance_id
         
-        # Wait a moment to ensure the thread has started
-        time.sleep(0.1)
+        try:
+            # Calculate audio duration and log
+            audio_duration = len(audio_data) / self.sample_rate
+            self._logger.info(f"Processing audio: {len(audio_data)} samples, duration: {audio_duration:.2f}s")
+            
+            # Check if audio has content
+            if audio_duration < 0.5:
+                self._logger.warning("Audio too short, skipping transcription")
+                return None
+            
+            # Simpler messages - just show we're transcribing
+            print(f"\n🎙️ Transcribing speech ({audio_duration:.1f}s)...")
+            start_time = time.time()
+            
+            # Scale audio to float between -1 and 1
+            if np.abs(audio_data).max() > 1.0:
+                audio_data = audio_data / np.abs(audio_data).max()
+            
+            # Prepare audio features
+            input_features = self._processor.feature_extractor(
+                audio_data, 
+                sampling_rate=self.sample_rate,
+                return_tensors="pt"
+            ).input_features.to(self.device)
+            
+            # Process with whisper model
+            with torch.inference_mode():
+                predicted_ids = self._model.generate(
+                    input_features,
+                    task="transcribe",
+                    language="en",
+                    do_sample=False
+                )
+            
+            # Decode the model output to text
+            transcription = self._processor.tokenizer.batch_decode(
+                predicted_ids,
+                skip_special_tokens=True
+            )[0].strip()
+            
+            elapsed = time.time() - start_time
+            self._logger.info(f"Transcription completed in {elapsed:.2f}s: '{transcription}'")
+            
+            # Only emit transcription if we have content
+            if transcription and len(transcription) > 0:
+                # Avoid duplicating silence markers
+                if transcription.lower() in ['silence', '[silence]', '<silence>']:
+                    self._logger.info("Silence detected, not emitting transcription event")
+                    return None
+                
+                # Single, clean output of what was transcribed
+                print(f"\n🗣️ You said: \"{transcription}\"")
+                
+                # Emit events
+                self.event_bus.publish("transcription_complete", transcription)
+                self.event_bus.publish("user_message", transcription)
+                
+                return transcription
+            else:
+                self._logger.warning("Empty transcription result, not emitting event")
+                return None
+            
+        except Exception as e:
+            self._logger.error(f"Error transcribing audio: {e}", exc_info=True)
+            print(f"\n❌ Transcription error: {str(e)}")
+            return None
     
     def process_live_transcription(self, audio_data: np.ndarray) -> None:
         """
@@ -153,12 +198,14 @@ class StreamingTranscriber:
         live_thread.daemon = True
         live_thread.start()
     
-    def _transcribe_audio(self, audio: np.ndarray) -> None:
+    def _transcribe_audio(self, audio: np.ndarray) -> str:
         """
         Convert speech to text using Whisper.
         
         Args:
             audio: Audio data as numpy array
+        Returns:
+            Transcribed text
         """
         try:
             self._is_transcribing = True
@@ -222,6 +269,8 @@ class StreamingTranscriber:
             self.event_bus.publish("transcription_complete", transcription)
             
             self._logger.debug(f"Transcription: {transcription}")
+            
+            return transcription
             
         except Exception as e:
             self._logger.error(f"Error in transcription: {e}", exc_info=True)

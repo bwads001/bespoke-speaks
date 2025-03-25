@@ -7,6 +7,7 @@ import time
 import numpy as np
 import torchaudio
 from huggingface_hub import hf_hub_download
+import asyncio
 
 from app.utils.event_bus import EventBus
 from app.utils.model_loader import ModelLoader
@@ -39,8 +40,15 @@ class Speaker:
         self._playback_thread: Optional[threading.Thread] = None
         self._should_stop_playback = False
         
+        # Add a lock to prevent concurrent generation
+        self._generation_lock = threading.Lock()
+        self._is_generating = False
+        
         # Register for interruption events
         self.event_bus.subscribe("user_interruption", self._handle_interruption)
+        
+        # Register to provide generation status
+        self.event_bus.subscribe("is_speech_generating", self._handle_is_generating_query)
         
         # Attempt to load models
         self._load_models()
@@ -101,112 +109,145 @@ class Speaker:
         self._logger.info("Playback interrupted by user")
         print("\n🤚 Playback interrupted by user")
     
-    def speak(self, 
-              text: str, 
-              blocking: bool = False) -> None:
+    def _handle_is_generating_query(self, _: Optional[dict] = None) -> bool:
         """
-        Convert text to speech and play it.
+        Handle query about generation status.
+        
+        Returns:
+            bool: True if currently generating speech, False otherwise
+        """
+        return self._is_generating
+    
+    def speak(self, text: str, voice_id: int = 0) -> bool:
+        """
+        Generate and play speech for the given text.
         
         Args:
-            text: Text to convert to speech
-            blocking: Whether to block until playback is complete
+            text: The text to speak
+            voice_id: The voice ID to use
+            
+        Returns:
+            True if generation was successful, False otherwise
         """
-        if not text:
-            self._logger.warning("Empty text provided to speak")
-            return
+        if self._is_generating:
+            self._logger.warning("Speech generation already in progress, ignoring request")
+            return False
         
-        # Log but don't print the text - let the caller handle display
-        self._logger.info(f"Speaking: {text[:50]}{'...' if len(text) > 50 else ''}")
-        
-        # Start playback in a separate thread if non-blocking
-        if not blocking:
+        try:
+            # Use threading instead of asyncio
             self._playback_thread = threading.Thread(
                 target=self._speak_impl,
-                args=(text,)
+                args=(text, voice_id)
             )
             self._playback_thread.daemon = True
             self._playback_thread.start()
-        else:
-            self._speak_impl(text)
+            return True
+        except Exception as e:
+            self._logger.error(f"Error speaking text: {e}")
+            self._is_generating = False
+            return False
 
-    def _speak_impl(self, text: str) -> None:
+    def _speak_impl(self, text: str, voice_id: int) -> bool:
+        """Implementation of speech generation and playback"""
+        generation_start = time.time()
+        
+        with self._generation_lock:
+            if self._is_generating:
+                return False
+            
+            self._is_generating = True
+            self.event_bus.publish("speech_generation_started", None)
+            
+            try:
+                # Generate speech
+                self._logger.info(f"Generating speech for text: {text}")
+                print(f"🔊 Generating speech...")
+                
+                # Get context segments for voice consistency
+                context_segments = self.event_bus.publish_and_get_result(
+                    "get_tts_context", 
+                    None, 
+                    default_result=[self.prompt_segment]
+                )
+                
+                self._logger.info(f"Using {len(context_segments)} context segments for voice consistency")
+                
+                # Use simple sequential generation to ensure reliability
+                audio = self.csm_generator.generate(
+                    text=text,
+                    speaker=voice_id,
+                    context=context_segments,
+                    batch_size=1,  # Use single token generation for reliability
+                    temperature=0.7,
+                    topk=50,
+                    use_kv_caching=True
+                )
+                
+                generation_time = time.time() - generation_start
+                self._logger.info(f"Speech generation completed in {generation_time:.2f}s")
+                
+                # Create a segment for the generated speech
+                segment = Segment(text=text, speaker=voice_id, audio=audio)
+                
+                # Publish the segment for context tracking
+                self.event_bus.publish("speech_generated", segment)
+                
+                # Play the generated audio
+                self._play_audio(audio)
+                
+                return True
+            except Exception as e:
+                self._logger.error(f"Error in speech generation: {e}")
+                print(f"\n❌ Speech generation error: {str(e)}")
+                return False
+            finally:
+                self._is_generating = False
+                self.event_bus.publish("speech_generation_completed", None)
+
+    def _play_audio(self, audio: torch.Tensor) -> None:
         """
-        Implementation of the speak method.
+        Play the generated audio.
         
         Args:
-            text: Text to speak
+            audio: The generated audio tensor
         """
-        # Check if we're in cleanup mode and avoid execution
         try:
-            import builtins
-            if hasattr(builtins, "_bespoke_cleaning_up") and getattr(builtins, "_bespoke_cleaning_up"):
-                self._logger.info("Skipping speech generation during application cleanup")
-                return
-        except:
-            pass
-            
-        # Start playback
-        self._is_speaking = True
-        self._should_stop_playback = False
-        
-        # Notify that TTS has started
-        self.event_bus.publish("tts_started", {"text": text})
-        
-        try:
-            # Generate speech using direct approach with our generator
-            self._logger.info(f"Generating speech for: {text}...")
-            print(f"🔊 Generating speech... [ID: speech-gen-{id(text)}]")
-            
-            # Generate audio using direct model access - no wrapper service call
-            generation_start = time.time()
-            
-            # Generate with direct model access
-            audio_tensor = self.csm_generator.generate(
-                text=text,
-                speaker=1,
-                context=[self.prompt_segment],
-                max_audio_length_ms=10_000,
-                temperature=0.7,
-                topk=50,
-            )
-            
             # Convert to numpy for playback
-            audio_np = audio_tensor.cpu().numpy()
+            audio_np = audio.cpu().numpy()
             
-            generation_time = time.time() - generation_start
-            self._logger.info(f"Speech generation took {generation_time:.2f} seconds")
-            
-            # Check if we should stop (user may have interrupted during generation)
-            if self._should_stop_playback:
-                self._logger.info("Playback canceled before it started")
-                return
-                
             # Calculate audio duration
             sample_rate = self.csm_generator.sample_rate
             audio_duration = len(audio_np) / sample_rate
-            self._logger.info(f"Audio duration: {audio_duration:.2f} seconds")
+            self._logger.info(f"Playing audio ({audio_duration:.2f}s)")
             
-            # Play audio with progress bar
-            print(f"🎧 Playing response ({audio_duration:.1f}s)...")
+            # Temporary buffer to allow playback adjustments
+            # (e.g., volume control could be added here in the future)
+            self._audio_buffer = audio_np
             
             # Start playback
-            sd.play(audio_np, sample_rate)
+            self._is_speaking = True
+            self._should_stop_playback = False
+            self.event_bus.publish("playback_started", {"duration": audio_duration})
             
-            # Show progress during playback
+            # Play the audio
             start_play_time = time.time()
+            sd.play(audio_np, sample_rate)
             
             # Monitor playback
             while not self._should_stop_playback and sd.get_stream().active:
                 elapsed = time.time() - start_play_time
                 progress = min(1.0, elapsed / audio_duration)
-                bars = int(progress * 20)
                 
-                # Don't spam the console with progress updates
-                if bars % 5 == 0:
-                    print(f"\r🎧 Playing: {bars*5}% [{'▓'*bars}{' '*(20-bars)}]", end="", flush=True)
-                    
+                # Update progress (optional)
+                self.event_bus.publish("playback_progress", {
+                    "elapsed": elapsed,
+                    "total": audio_duration,
+                    "progress": progress
+                })
+                
+                # Yield to other threads
                 time.sleep(0.1)
-                
+            
             # If stopped early
             if self._should_stop_playback:
                 sd.stop()
@@ -215,25 +256,19 @@ class Speaker:
                 # If completed normally
                 print("\r🎧 Playback complete                         ")
                 
-            # Wait for playback to finish completely (max 0.5s)
-            sd.wait(0.5)
+            # Reset speaking flag
+            self._is_speaking = False
+            
+            # Signal playback completion
+            self.event_bus.publish("playback_finished", None)
             
             # Add a small pause after speech
             time.sleep(0.2)
-            
         except Exception as e:
-            error_msg = str(e)
-            
-            # Error reporting without fallback
-            self._logger.error(f"Speech generation error: {e}", exc_info=True)
-            print(f"\n❌ Speech generation error: {error_msg}")
-            self.event_bus.publish("speak_error", error_msg)
-            
-        finally:
+            self._logger.error(f"Error during audio playback: {e}")
             self._is_speaking = False
-            # Notify that TTS has finished, regardless of success or failure
-            self.event_bus.publish("tts_finished", None)
-    
+            self.event_bus.publish("playback_error", str(e))
+
     def stop_playback(self) -> None:
         """Stop any ongoing speech playback."""
         self._should_stop_playback = True
@@ -248,24 +283,53 @@ class Speaker:
         Check if currently speaking.
         
         Returns:
-            True if currently speaking, False otherwise
+            bool: True if currently speaking, False otherwise
         """
         return self._is_speaking
-
-    def wait_for_playback_complete(self, timeout: float = 30.0) -> None:
+        
+    def is_generating(self) -> bool:
         """
-        Wait for current playback to complete.
+        Check if currently generating speech.
+        
+        Returns:
+            bool: True if currently generating speech, False otherwise
+        """
+        return self._is_generating
+
+    def wait_for_playback_complete(self, timeout: float = 60.0) -> bool:
+        """
+        Wait for audio playback to complete.
         
         Args:
-            timeout: Maximum seconds to wait
-        """
-        if not self._is_speaking:
-            return
+            timeout: Maximum time to wait in seconds
             
+        Returns:
+            True if playback completed successfully, False if timed out
+        """
         start_time = time.time()
+        print(f"⏳ Waiting for speech generation and playback to complete...")
         
-        while self._is_speaking and time.time() - start_time < timeout:
+        # First wait for generation to complete
+        while self._is_generating:
+            if time.time() - start_time > timeout:
+                self._logger.warning(f"Timed out waiting for speech generation after {timeout}s")
+                print(f"⚠️ Timed out waiting for speech generation")
+                return False
             time.sleep(0.1)
+        
+        # Then wait for playback to complete
+        while self._is_speaking:
+            if time.time() - start_time > timeout:
+                self._logger.warning(f"Timed out waiting for speech playback after {timeout}s")
+                print(f"⚠️ Timed out waiting for speech playback")
+                return False
+            time.sleep(0.1)
+        
+        elapsed = time.time() - start_time
+        if elapsed > 1.0:  # Only log if we actually had to wait
+            print(f"✅ Speech generation and playback completed in {elapsed:.1f}s")
+        
+        return True
 
     def cleanup(self) -> None:
         """Clean up resources used by the speaker."""

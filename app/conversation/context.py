@@ -65,15 +65,14 @@ class ConversationContext:
         Returns:
             List of context segments
         """
-        # For now, only include the initial prompt to avoid KV cache issues
-        # This is a temporary fix until we can properly handle multiple segments
+        # Start with the initial prompt
         context = [self.initial_prompt]
         
-        # Commented out to prevent KV cache errors
-        # if self.generated_segments:
-        #     # Get the most recent segments up to max_context_segments
-        #     recent_segments = self.generated_segments[-self.max_context_segments:] if len(self.generated_segments) > self.max_context_segments else self.generated_segments
-        #     context.extend(recent_segments)
+        # Add recent segments to provide voice consistency
+        if self.generated_segments:
+            # Get the most recent segments up to max_context_segments
+            recent_segments = self.generated_segments[-self.max_context_segments:] if len(self.generated_segments) > self.max_context_segments else self.generated_segments
+            context.extend(recent_segments)
         
         self._logger.debug(f"Providing {len(context)} context segments for TTS")
         return context

@@ -110,11 +110,8 @@ class VoiceActivityDetector:
                 rms_scaled = min(1.0, rms_energy / 0.3)
                 meter = "▁▂▃▄▅▆▇█"[min(7, int(rms_scaled * 8))]
                 
-                # Simplified status display
-                if self._is_speaking:
-                    status = "SPEAKING"
-                else:
-                    status = "LISTENING"
+                # Unified status display - just the state changes, not multiple meters
+                status = "SPEAKING" if self._is_speaking else "LISTENING"
                 
                 # Clear line and print updated meter
                 print(f"\r\033[K🎤 {meter} {bar} {percentage:3d}% | {status}", end="", flush=True)
@@ -135,7 +132,6 @@ class VoiceActivityDetector:
             if rms_energy > self._energy_threshold:
                 self._is_speaking = True
                 self._last_speech_time = time.time()
-                print("\n\r\033[K🎙️ Listening to your message...", flush=True)
         
         # End speaking when we have enough silence frames AND enough time has passed
         elif self._is_speaking:
@@ -143,7 +139,8 @@ class VoiceActivityDetector:
                 time_since_speech = time.time() - self._last_speech_time
                 if time_since_speech >= self._silence_duration:
                     self._is_speaking = False
-                    print("\n\r\033[K🔍 Processing your message...", flush=True)
+                    # Print a cleaner transition message
+                    print("\n\r\033[K🔊 Processing your speech...", flush=True)
                     return False
         
         return self._is_speaking
@@ -171,6 +168,20 @@ class VoiceActivityDetector:
                 
         return False
 
+    def reset(self) -> None:
+        """Reset the detector state."""
+        self._noise_levels = []
+        self._noise_floor = 0.0005
+        self._adaptive_threshold = self._energy_threshold
+        self._noise_calibration_frames = 0
+        self._consecutive_speech_frames = 0
+        self._consecutive_silence_frames = 0
+        self._last_speech_time = None
+        self._is_speaking = False
+        self._debug_counter = 0
+        self._last_printed_level = -1
+        self._logger.debug("Voice activity detector reset")
+
 
 class StreamingRecorder:
     """
@@ -184,7 +195,8 @@ class StreamingRecorder:
     def __init__(self, 
                  sample_rate: int = 16000, 
                  chunk_size: int = 1600, 
-                 event_bus: Optional[EventBus] = None):
+                 event_bus: Optional[EventBus] = None,
+                 device_name: Optional[str] = None):
         """
         Initialize the streaming recorder.
         
@@ -192,47 +204,101 @@ class StreamingRecorder:
             sample_rate: Audio sample rate (Hz)
             chunk_size: Size of audio chunks to process
             event_bus: Event bus for publishing events
+            device_name: Optional name of audio device to use
         """
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.event_bus = event_bus or EventBus()
         self.vad = VoiceActivityDetector(sample_rate=sample_rate)
         self._logger = logging.getLogger("StreamingRecorder")
+        self.device_name = device_name
         
         # State
-        self.buffer: List[np.ndarray] = []
-        self.is_recording = False
+        self._buffer: List[np.ndarray] = []
+        self._energy_history = []
+        self.is_streaming = False
         self.stream: Optional[sd.InputStream] = None
         self._recording_thread: Optional[threading.Thread] = None
         
         # Minimum buffer size before considering it a complete utterance
         self.min_buffer_size = int(0.5 * self.sample_rate / self.chunk_size)  # 0.5 seconds
+        
+        # Maximum buffer size to prevent excessive memory usage (5 seconds of no speech)
+        self.max_silence_buffer_size = int(5 * self.sample_rate / self.chunk_size)
+        
+        # Flag to track if we've detected speech in the current buffer
+        self.speech_detected_in_buffer = False
+        
+        # Counter for silence chunks - used to determine when to clear buffer
+        self.silence_chunk_count = 0
+        
+        # Last time speech was detected
+        self.last_speech_time = None
     
     def start_streaming(self) -> None:
-        """Begin streaming audio capture with continuous VAD processing."""
-        if self.is_recording:
-            self._logger.warning("Recording already in progress")
+        """Start streaming audio recording."""
+        if self.is_streaming:
+            self._logger.warning("Audio recording already in progress")
             return
-            
-        self.buffer = []
-        self.is_recording = True
         
-        # Only print the listening message once here, not in _recording_loop
-        print("\n👂 Listening for speech...")
+        # Check if speech is still being generated
+        is_generating = self.event_bus.publish_and_get_result(
+            "is_speech_generating", None, default_result=False
+        )
+        
+        if is_generating:
+            self._logger.warning("Cannot start recording while speech is being generated")
+            print("⚠️ Waiting for speech generation to complete before listening...")
+            
+            # Wait a bit and retry
+            time.sleep(1.0)
+            return self.start_streaming()
+        
+        self._logger.info("Starting audio streaming")
+        print(f"\n👂 Listening for speech...")
+        
+        # Print UI message
         print("┌─────────────────────────────────────┐")
         print("│ 🎙️  Speak now - I'm listening        │")
         print("└─────────────────────────────────────┘")
         
-        # Start recording in a separate thread to avoid blocking
-        self._recording_thread = threading.Thread(target=self._recording_loop)
-        self._recording_thread.daemon = True
-        self._recording_thread.start()
+        # Initialize state
+        self._buffer = []
+        self._energy_history = []
+        self.is_streaming = True
+        self._should_stop = False
+        self.vad.reset()
         
-        self._logger.info("Streaming recorder started")
+        # Get available audio devices
+        devices = sd.query_devices()
+        mic_name = "default"
+        if self.device_name is not None:
+            for i, device in enumerate(devices):
+                if self.device_name.lower() in device['name'].lower() and device['max_input_channels'] > 0:
+                    mic_name = device['name']
+                    break
+        
+        print(f"\n🎙️ Using microphone: {mic_name}")
+        
+        # Start audio stream
+        self.stream = sd.InputStream(
+            callback=self._audio_callback,
+            channels=1,
+            samplerate=self.sample_rate,
+            blocksize=self.chunk_size,
+            device=None if self.device_name is None else self.device_name
+        )
+        
+        # Start the stream
+        self.stream.start()
+        
+        # Create progress indicator
+        self._progress_thread = threading.Thread(target=self._update_progress, daemon=True)
+        self._progress_thread.start()
     
     def stop_streaming(self) -> None:
         """Stop the streaming recorder."""
-        self.is_recording = False
+        self.is_streaming = False
         
         if self.stream:
             self.stream.stop()
@@ -271,7 +337,7 @@ class StreamingRecorder:
             print("\n")
             
             # Keep running until stopped
-            while self.is_recording:
+            while self.is_streaming:
                 time.sleep(0.1)  # Reduce CPU usage
                 
         except Exception as e:
@@ -300,90 +366,97 @@ class StreamingRecorder:
         # Use raw audio data without normalization
         audio_chunk = indata.copy().flatten()
         
-        # Add to buffer - use raw audio values
-        self.buffer.append(audio_chunk)
-        
         # Check for speech activity
         was_speaking = self.vad._is_speaking  # Save previous state
         is_speaking = self.vad.is_speech(audio_chunk)
         
-        # If speech detected, publish event
+        # Track if speech was detected in the current buffer
         if is_speaking:
+            self.speech_detected_in_buffer = True
+            self.silence_chunk_count = 0
+            self.last_speech_time = time.time()
             self.event_bus.publish("speech_detected", audio_chunk)
+        else:
+            self.silence_chunk_count += 1
+        
+        # Check if buffer has grown too large without speech
+        if not self.speech_detected_in_buffer and len(self._buffer) > self.max_silence_buffer_size:
+            # If we've accumulated too much silence without any speech, clear the buffer
+            self._logger.info(f"Buffer reached {len(self._buffer)} chunks without speech - clearing")
+            self._buffer = []
+            return
+        
+        # Add to buffer - only add if we're speaking or have spoken recently
+        if is_speaking or was_speaking or self.speech_detected_in_buffer:
+            self._buffer.append(audio_chunk)
         
         # FORCIBLY check for utterance completion if we stopped speaking
         # This ensures we don't miss the end of speech
         if was_speaking and not is_speaking:
             self._logger.info("Speech->silence transition detected")
-            print("\n🔊 Speech->silence transition detected - processing utterance")
             
             # Force a small delay to collect a bit more audio after speech ends
             time.sleep(0.1)
             
-            # Clear the level meter line before processing
-            print("\r\033[K", end="", flush=True)
-            
             # Process the completed utterance if we have enough audio
             # Use a minimum requirement of at least a few frames
-            if len(self.buffer) >= 3:  # Very low minimum requirement
+            if len(self._buffer) >= 3:  # Very low minimum requirement
                 self._process_utterance()
+                # Reset speech detection flag
+                self.speech_detected_in_buffer = False
+                self.last_speech_time = None
                 return
             else:
                 print("\n⚠️ Buffer too small, waiting for more audio...")
         
         # Regular check for utterance boundary - make this more sensitive
-        if self.vad.is_utterance_boundary(self.buffer) and len(self.buffer) >= 3:
+        if self.vad.is_utterance_boundary(self._buffer) and len(self._buffer) >= 3:
             self._logger.info("Utterance boundary detected via regular check")
-            print("\n🔊 Utterance boundary detected via regular check")
             self._process_utterance()
+            # Reset speech detection flag
+            self.speech_detected_in_buffer = False
+            self.last_speech_time = None
     
     def _process_utterance(self):
         """Process a completed utterance from the buffer."""
         # Combine all audio chunks into a single array
-        if not self.buffer:
+        if not self._buffer:
             self._logger.warning("Empty buffer in _process_utterance")
             return
             
-        complete_audio = np.concatenate(self.buffer)
+        # Add padding to beginning to avoid cutting off the first word
+        # Add silent frames at the beginning to ensure we catch the start of speech
+        leading_silence = np.zeros(int(0.2 * self.sample_rate), dtype=np.float32)  # 200ms leading silence
+        
+        # Add padding at the end to avoid cutting off the last word
+        trailing_silence = np.zeros(int(0.2 * self.sample_rate), dtype=np.float32)  # 200ms trailing silence
+        
+        # Concatenate with padding
+        complete_audio = np.concatenate([leading_silence] + self._buffer + [trailing_silence])
         
         # Check if audio has sufficient energy to be valid speech
-        audio_energy = np.mean(np.abs(complete_audio))
         audio_duration = len(complete_audio) / self.sample_rate
+        audio_energy = np.mean(np.abs(complete_audio))
         
-        # Log the audio energy and duration
-        self._logger.info(f"Utterance completed: {audio_duration:.2f}s, energy: {audio_energy:.6f}")
+        # Just log details without cluttering the console
+        self._logger.info(f"Utterance details: {audio_duration:.2f}s, {len(self._buffer)} chunks, energy: {audio_energy:.6f}")
         
-        # Very relaxed criteria for valid speech to ensure transcription happens:
-        # 1. Minimal duration (at least 0.2 seconds)
-        # 2. Any energy above absolute minimum
-        valid_energy = audio_energy > self.vad._noise_floor * 2  # Just 2x noise floor
-        valid_duration = audio_duration > 0.2  # Even shorter minimum duration
-        
-        # Print buffer details for debugging
-        print(f"\n🎙️ Utterance details: {audio_duration:.2f}s, {len(self.buffer)} chunks, energy: {audio_energy:.6f}")
+        valid_energy = audio_energy > 0.001  # Energy threshold for valid speech
+        valid_duration = audio_duration >= 0.5  # Minimum length in seconds
         
         if valid_energy and valid_duration:
-            # Add extra newline to ensure separation from audio level meter
-            print("\n")
-            self._logger.info(f"Publishing utterance_complete event with {audio_duration:.2f}s of audio (energy: {audio_energy:.6f})")
-            print(f"🔄 Processing audio clip: {audio_duration:.1f}s | Energy: {audio_energy:.4f}")
-            
-            # Publish the speech_ended event
-            self.event_bus.publish("speech_ended", complete_audio)
-            
-            # Publish the utterance_complete event with debug info
-            print(f"📢 Sending utterance to transcriber (length: {len(complete_audio)} samples)")
+            # Send to transcriber without redundant messages
+            self._logger.info(f"Sending utterance to transcriber (length: {len(complete_audio)} samples)")
+            # Publish the utterance for processing by transcriber
             self.event_bus.publish("utterance_complete", complete_audio)
-            
-            # Force a small wait to ensure the event has time to be processed
-            time.sleep(0.1)
         else:
-            reason = "too short" if not valid_duration else "low energy"
-            self._logger.info(f"Ignoring audio due to {reason}: duration={audio_duration:.2f}s, energy={audio_energy:.6f}")
+            # Skip processing for very short or quiet audio
+            reason = "low energy" if not valid_energy else "short duration"
+            self._logger.warning(f"Skipping audio ({reason}): duration={audio_duration:.2f}s, energy={audio_energy:.6f}")
             print(f"\n⚠️ Skipping audio ({reason}): duration={audio_duration:.2f}s, energy={audio_energy:.6f}")
         
         # Reset the buffer
-        self.buffer = []
+        self._buffer = []
     
     def record_for_duration(self, duration: float) -> np.ndarray:
         """
@@ -440,4 +513,19 @@ class StreamingRecorder:
         except Exception as e:
             self._logger.error(f"Error recording audio: {e}")
             # Return silent audio as fallback
-            return np.zeros(int(duration * self.sample_rate), dtype=np.float32) 
+            return np.zeros(int(duration * self.sample_rate), dtype=np.float32)
+
+    def _update_progress(self) -> None:
+        """Update the progress indicator for audio recording."""
+        try:
+            # Keep updating until streaming stops
+            while self.is_streaming:
+                # Print a simple placeholder for better UI experience
+                # Actual audio levels are handled in the audio callback
+                time.sleep(0.5)
+            
+        except Exception as e:
+            self._logger.error(f"Error in progress indicator: {e}")
+            print(f"\n❌ Progress indicator error: {e}")
+        finally:
+            self._logger.debug("Progress indicator thread stopped") 

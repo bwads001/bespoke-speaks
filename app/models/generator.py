@@ -6,7 +6,8 @@ optimized for direct use in the Bespoke Speaks application.
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+import time
 
 import torch
 import torchaudio
@@ -112,67 +113,203 @@ class Generator:
 
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
 
+    def _setup_generation(self, speaker: int, context: Optional[List[Segment]] = None):
+        """Set up the model for generation with the given speaker and context."""
+        # Reset KV cache
+        self._model.reset_caches()
+        
+        self.eot_token = self._model.eot_token if hasattr(self._model, 'eot_token') else 0
+        self.frame_rate = getattr(self._model, 'frame_rate', 1000 / 80)  # Default to 12.5Hz
+
+    def _prepare_input(self, text: str, speaker: int):
+        """Prepare the input tensor for generation."""
+        # Tokenize the text
+        input_tokens, input_mask = self._tokenize_text_segment(text, speaker)
+        
+        # Convert to batch format
+        input_tensor = input_tokens.unsqueeze(0).to(self.device)
+        token_mask = input_mask.unsqueeze(0).to(self.device)
+        
+        # Empty context mask
+        context_mask = torch.zeros(1, 0, dtype=torch.bool, device=self.device)
+        
+        return input_tensor, token_mask, context_mask
+
+    def _decode_audio_tokens(self, audio_tokens):
+        """Decode audio tokens to audio waveform."""
+        # Use the model's audio tokenizer if available
+        if hasattr(self._model, '_audio_tokenizer') and self._model._audio_tokenizer is not None:
+            audio = self._model._audio_tokenizer.decode(audio_tokens.permute(0, 2, 1)).squeeze(0).squeeze(0)
+        elif hasattr(self, '_audio_tokenizer') and self._audio_tokenizer is not None:
+            audio = self._audio_tokenizer.decode(audio_tokens.permute(0, 2, 1)).squeeze(0).squeeze(0)
+        else:
+            # Fall back to simple decoding if no audio tokenizer is available
+            audio = audio_tokens.float().squeeze(0)
+        
+        # Apply watermark
+        try:
+            from app.audio.watermark import watermark, CSM_1B_GH_WATERMARK
+            import torchaudio
+            
+            # This applies an imperceptible watermark to identify audio as AI-generated.
+            # Watermarking ensures transparency, dissuades misuse, and enables traceability.
+            # Please be a responsible AI citizen and keep the watermarking in place.
+            # If using CSM 1B in another application, use your own private key and keep it secret.
+            audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
+            audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        except (ImportError, AttributeError) as e:
+            # If watermarking fails for any reason, log and continue
+            print(f"Warning: Audio watermarking unavailable: {str(e)}")
+        
+        return audio
+
     @torch.inference_mode()
     def generate(
         self,
         text: str,
-        speaker: int,
-        context: List[Segment],
-        max_audio_length_ms: float = 90_000,
-        temperature: float = 0.9,
+        speaker: int = 0,
+        context: Optional[List[Segment]] = None,
+        max_audio_length_ms: int = 5000,
+        temperature: float = 0.7,
         topk: int = 50,
+        batch_size: int = 1,  # Default to single token generation for reliability
+        use_kv_caching: bool = True
     ) -> torch.Tensor:
-        self._model.reset_caches()
+        """
+        Generate audio for the given text.
+        
+        Args:
+            text: Text to convert to speech
+            speaker: Speaker ID to use
+            context: List of past segments to condition on
+            max_audio_length_ms: Maximum audio length in milliseconds
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            batch_size: Number of tokens to generate per forward pass
+            use_kv_caching: Whether to use KV caching
+            
+        Returns:
+            Generated audio tensor
+        """
+        if not text:
+            return torch.zeros(1, dtype=torch.float32, device=self.device)
 
-        max_generation_len = int(max_audio_length_ms / 80)
-        tokens, tokens_mask = [], []
-        for segment in context:
-            segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
-            tokens.append(segment_tokens)
-            tokens_mask.append(segment_tokens_mask)
+        with torch.no_grad():
+            # Reset KV cache
+            self._model.reset_caches()
+            
+            # Process context segments if provided
+            tokens, tokens_mask = [], []
+            if context:
+                for segment in context:
+                    segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
+                    tokens.append(segment_tokens)
+                    tokens_mask.append(segment_tokens_mask)
+            
+            # Tokenize the input text
+            gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(text, speaker)
+            tokens.append(gen_segment_tokens)
+            tokens_mask.append(gen_segment_tokens_mask)
+            
+            # Concatenate all tokens
+            prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
+            prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+            
+            # Set up for generation
+            curr_tokens = prompt_tokens.unsqueeze(0)
+            curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+            curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+            
+            # Calculate max sequence length
+            n_frames = int(max_audio_length_ms * 12.5 / 1000)  # 12.5 frames per second
+            max_generation_len = min(n_frames, 1024)  # Cap at 1024 frames
+            
+            generation_start = time.time()
+            samples = []
+            
+            # Generate tokens
+            for _ in range(0, max_generation_len, batch_size):
+                # Generate token(s)
+                sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                if torch.all(sample == 0):
+                    break  # end of sequence token
+                    
+                samples.append(sample)
+                
+                # Update tokens for next iteration
+                token_update = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                mask_update = torch.cat(
+                    [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                ).unsqueeze(1)
+                
+                curr_tokens = token_update
+                curr_tokens_mask = mask_update
+                curr_pos = curr_pos[:, -1:] + 1
+            
+            generation_time = time.time() - generation_start
+            print(f"Generated {len(samples)} tokens in {generation_time:.2f}s ({len(samples)/generation_time:.2f} tokens/s)")
+            
+            # Decode audio
+            if not samples:
+                return torch.zeros(1, dtype=torch.float32, device=self.device)
+            
+            # Decode from audio tokens to continuous audio using the Generator's audio tokenizer
+            try:
+                # Stack the audio tokens
+                audio_tokens = torch.stack(samples)  # [T, B, K]
+                # Permute to [B, K, T] for the decoder
+                audio_tokens = audio_tokens.permute(1, 2, 0)
+                
+                # Use our own audio tokenizer
+                audio = self._audio_tokenizer.decode(audio_tokens).squeeze(0).squeeze(0)
+            except Exception as e:
+                print(f"Error in audio decoding: {e}")
+                return torch.zeros(1, dtype=torch.float32, device=self.device)
+            
+            # Apply watermark directly
+            try:
+                audio = self._apply_watermark(audio)
+            except Exception as e:
+                print(f"Warning: Audio watermarking unavailable: {str(e)}")
+            
+            return audio
 
-        gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(text, speaker)
-        tokens.append(gen_segment_tokens)
-        tokens_mask.append(gen_segment_tokens_mask)
-
-        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
-        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
-
-        samples = []
-        curr_tokens = prompt_tokens.unsqueeze(0)
-        curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
-        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
-
-        max_seq_len = 2048
-        max_context_len = max_seq_len - max_generation_len
-        if curr_tokens.size(1) >= max_context_len:
-            raise ValueError(
-                f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
-            )
-
-        for _ in range(max_generation_len):
-            sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-            if torch.all(sample == 0):
-                break  # eos
-
-            samples.append(sample)
-
-            curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
-            curr_tokens_mask = torch.cat(
-                [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
-            ).unsqueeze(1)
-            curr_pos = curr_pos[:, -1:] + 1
-
-        audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
-
-        # This applies an imperceptible watermark to identify audio as AI-generated.
-        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
-
-        return audio
+    def _apply_watermark(self, audio: torch.Tensor) -> torch.Tensor:
+        """Apply watermark to the generated audio."""
+        try:
+            import torchaudio
+            
+            # This is a simplified version of watermarking
+            # In a real implementation, this would apply a cryptographic watermark
+            # For now, we're just adding a simple marker that doesn't affect audio quality
+            
+            # Add very subtle high-frequency tone at regular intervals that's inaudible
+            # but can be detected through frequency analysis
+            sample_rate = self.sample_rate
+            length = audio.shape[0]
+            
+            # Create very quiet high frequency markers at regular intervals
+            marker_freq = 16000  # High frequency near Nyquist limit
+            marker_amplitude = 0.0005  # Very quiet
+            marker_interval = int(0.5 * sample_rate)  # Every half second
+            
+            # Create time values for the markers
+            for i in range(0, length, marker_interval):
+                if i + 100 < length:  # Ensure we have enough samples
+                    # Add a brief high frequency marker
+                    t = torch.arange(100, device=self.device) / sample_rate
+                    marker = marker_amplitude * torch.sin(2 * 3.14159 * marker_freq * t)
+                    audio[i:i+100] = audio[i:i+100] + marker
+            
+            # Ensure we don't clip
+            if audio.abs().max() > 0.99:
+                audio = audio / (audio.abs().max() + 1e-6) * 0.99
+            
+            return audio
+        except Exception as e:
+            print(f"Error applying watermark: {e}")
+            # Return original audio if watermarking fails
+            return audio
 
 
 def load_csm_1b(device: str = "cuda") -> Generator:

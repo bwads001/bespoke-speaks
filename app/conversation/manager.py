@@ -172,7 +172,6 @@ class ConversationManager:
             return
             
         self._logger.info(f"Transcription received: {text}")
-        print(f"\n🗣️ You said: \"{text}\"")
         
         # Add to conversation as a user message
         self.handle_user_message(text)
